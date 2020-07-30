@@ -5,16 +5,28 @@
 #include <linux/list.h>
 #include <linux/sched.h>
 
+struct vmrange_node {
+
+  unsigned long start;
+  unsigned long end;
+
+  struct vmrange_node *next;
+
+};
+
 struct task_data {
 
   // what task_struct is this for?
   const struct task_struct *tsk;
 
   struct snapshot ss;
-  unsigned long *snapshot_open_fds;
+  unsigned long * snapshot_open_fds;
 
-  // list helper
-  struct list_head l;
+  struct vmrange_node *allowlist, *blocklist;
+  int                  config;
+
+  struct list_head list;
+  struct rcu_head  rcu;
 
 };
 
@@ -53,3 +65,4 @@ static inline bool had_snapshot(struct task_data *data) {
 }
 
 #endif
+

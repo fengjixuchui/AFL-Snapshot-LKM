@@ -13,9 +13,10 @@
 #include <linux/kallsyms.h>
 
 #include "task_data.h"  // mm associated data
-#include "hook.h"             // function hooking
-#include "snapshot.h"         // main implementation
+#include "hook.h"       // function hooking
+#include "snapshot.h"   // main implementation
 #include "debug.h"
+#include "symbols.h"
 
 #include "afl_snapshot.h"
 
@@ -26,6 +27,13 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("kallsyms & andreafioraldi");
 MODULE_DESCRIPTION("Fast process snapshots for fuzzing");
 MODULE_VERSION("1.0.0");
+
+void (*k_flush_tlb_mm_range)(struct mm_struct *mm, unsigned long start,
+                             unsigned long end, unsigned int stride_shift,
+                             bool freed_tables);
+
+void (*k_zap_page_range)(struct vm_area_struct *vma, unsigned long start,
+                         unsigned long size);
 
 int            mod_major_num;
 struct class * mod_class;
@@ -43,18 +51,64 @@ static char *mod_devnode(struct device *dev, umode_t *mode) {
 long mod_dev_ioctl(struct file *filep, unsigned int cmd, unsigned long arg) {
 
   switch (cmd) {
-  
-    case AFL_SNAPSHOT_IOCTL_DO: {
-    
-      DBG_PRINT("Calling do_snapshot");
 
-      return do_snapshot();
+    case AFL_SNAPSHOT_EXCLUDE_VMRANGE: {
+
+      DBG_PRINT("Calling afl_snapshot_exclude_vmrange");
+
+      struct afl_snapshot_vmrange_args args;
+      if (copy_from_user(&args, (void *)arg,
+                         sizeof(struct afl_snapshot_vmrange_args)))
+        return -EINVAL;
+
+      exclude_vmrange(args.start, args.end);
+      return 0;
+
+    }
+
+    case AFL_SNAPSHOT_INCLUDE_VMRANGE: {
+
+      DBG_PRINT("Calling afl_snapshot_include_vmrange");
+
+      struct afl_snapshot_vmrange_args args;
+      if (copy_from_user(&args, (void *)arg,
+                         sizeof(struct afl_snapshot_vmrange_args)))
+        return -EINVAL;
+
+      include_vmrange(args.start, args.end);
+      return 0;
+
+    }
+
+    case AFL_SNAPSHOT_IOCTL_TAKE: {
+
+      DBG_PRINT("Calling afl_snapshot_take");
+
+      return take_snapshot(arg);
+
+    }
+
+    case AFL_SNAPSHOT_IOCTL_DO: {
+
+      DBG_PRINT("Calling afl_snapshot_do");
+
+      return take_snapshot(AFL_SNAPSHOT_MMAP | AFL_SNAPSHOT_FDS |
+                           AFL_SNAPSHOT_REGS | AFL_SNAPSHOT_EXIT);
+
+    }
+
+    case AFL_SNAPSHOT_IOCTL_RESTORE: {
+
+      DBG_PRINT("Calling afl_snapshot_restore");
+
+      recover_snapshot();
+      return 0;
 
     }
 
     case AFL_SNAPSHOT_IOCTL_CLEAN: {
-    
-      DBG_PRINT("Calling clean_snapshot");
+
+      DBG_PRINT("Calling afl_snapshot_clean");
 
       clean_snapshot();
       return 0;
@@ -88,9 +142,8 @@ syscall_handler_t orig_sct_exit_group = NULL;
 
 asmlinkage int sys_exit_group(struct pt_regs *regs) {
 
-  if (exit_snapshot())
-    return orig_sct_exit_group(regs);
-  
+  if (exit_snapshot()) return orig_sct_exit_group(regs);
+
   return 0;
 
 }
@@ -99,16 +152,16 @@ static void **get_syscall_table(void) {
 
   void **syscall_table = NULL;
 
-  syscall_table = kallsyms_lookup_name("sys_call_table");
+  syscall_table = (void**)SYMADDR_sys_call_table;
 
   if (syscall_table) { return syscall_table; }
 
   int                i;
-  unsigned long long s0 = kallsyms_lookup_name("__x64_sys_read");
-  unsigned long long s1 = kallsyms_lookup_name("__x64_sys_write");
+  unsigned long long s0 = SYMADDR___x64_sys_read;
+  unsigned long long s1 = SYMADDR___x64_sys_read;
 
   unsigned long long *data =
-      (unsigned long long *)((uint64_t)kallsyms_lookup_name("_etext") & ~0x7);
+      (unsigned long long *)(SYMADDR__etext & ~0x7);
   for (i = 0; (unsigned long long)(&data[i]) < ULLONG_MAX; i++) {
 
     unsigned long long d;
@@ -162,6 +215,19 @@ static void unpatch_syscall_table(void) {
   disable_write_protection();
   syscall_table_ptr[__NR_exit_group] = orig_sct_exit_group;
   enable_write_protection();
+
+}
+
+int snapshot_initialize_k_funcs() {
+
+  k_flush_tlb_mm_range = (void *)SYMADDR_flush_tlb_mm_range;
+  k_zap_page_range = (void *)SYMADDR_zap_page_range;
+
+  if (!k_flush_tlb_mm_range || !k_zap_page_range) { return -ENOENT; }
+
+  SAYF("All loaded");
+
+  return 0;
 
 }
 
@@ -236,7 +302,7 @@ static int __init mod_init(void) {
     return -ENOENT;
 
   }
-  
+
   if (!try_hook("do_exit", &exit_hook)) {
 
     FATAL("Unable to hook do_exit");
